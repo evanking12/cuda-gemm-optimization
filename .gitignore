@@ -1,0 +1,63 @@
+# Executables
+*.exe
+*.out
+bin/
+
+# Object files
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Visual Studio
+.vs/
+x64/
+Debug/
+Release/
+*.vcxproj.user
+*.suo
+*.log
+*.tlog
+*.cache
+*.deps
+*.recipe
+
+# Nsight profiles (too large for git)
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.nvvp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+~*
+
+# Build artifacts
+*.Build.CppClean.log
+*.vcxproj.FileListAbsolute.txt
+
+# CUDA compiler temps
+*.cu.cache
+*.cu.obj
+*.cu.deps
+
+# Old files in root (use kernels/ folder instead)
+kernel.cu
+naive_matrixmul.cu
+matrixmul_tiled.cu
+matrixmul_registerblocking.cu
+register_blocking_vectorized.cu
+register_blocking_vectorized_regtile4.cu
+rectangular_tiling.cu
+warp_aware_rectangular.cu
+4500g_kunroll8.cu
+4800g_kunroll16.cu
+
