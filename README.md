@@ -200,11 +200,10 @@ for (int k = 0; k < TILESIZE; k++) {
 - Arithmetic intensity: 32 FLOP/byte
 - Register usage: ~50 per thread
 
-Upon first glance; register blocking seems like a massive success, loading up Nsight compute and seeing
-(images/registerblockingregtile2.png)
-91% compute and 92% memory utilization might lead you to believe that this is nearing the limits of the card.
-Its not, just the load and store pipeline nearing its limit (bad); FMA is what we want here.
-In comparison to cuBLAS its.. getting there, but now we just made ourselve memory bottlenecked, not what you want.
+Upon first glance, register blocking seems like a massive success. Loading up Nsight Compute and seeing 91% compute and 92% memory utilization might lead you to believe that this is nearing the limits of the card. It's not - just the load and store pipeline nearing its limit (bad); FMA is what we want here. In comparison to cuBLAS, it's getting there, but now we just made ourselves memory bottlenecked, not what you want.
+
+![Register Blocking Metrics](images/registerblockingregtile2.png)
+*Register blocking showing high utilization but wrong pipeline*
 
 ![Register Blocking Pipeline Utilization](images/pipeUtilizationregisterblockingregtile2.png)
 *Improved pipeline utilization with register blocking*
