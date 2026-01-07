@@ -666,3 +666,6 @@ Most tutorials teach square tiles (4×4, 8×8). But:
 
 **License:** MIT - Use freely, attribution appreciated
 
+Currently; cuBLAS makes use of 33% occupancy; 4 warps per scheduler . My implementation is 25% occupancy and 3 warps per scheduler.
+I believe there to be most if not all of the performance difference. 
+I am going to have to mess around with differing rectangular tiling options in order to hit these occupancy numbers.
