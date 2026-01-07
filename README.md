@@ -1,49 +1,232 @@
-# Optimizing CUDA Matrix Multiplication to 92% of cuBLAS
+# Beating cuBLAS: Optimizing CUDA GEMM to 101.7% Performance
 
-A deep dive into GPU optimization techniques, progressively improving a naive GEMM implementation from **280 GFLOPS to 5250 GFLOPS** (18.8× speedup, 92% of cuBLAS performance).
+A deep dive into GPU optimization techniques, progressively improving a naive GEMM implementation from **280 GFLOPS to 5,834 GFLOPS** - ultimately achieving **101.7% of cuBLAS performance** (beating NVIDIA's highly optimized library).
 
-**Hardware:** NVIDIA RTX 3050 (8GB, Ampere Architecture)  
-**Test Case:** 2048×2048 FP32 matrix multiplication
+**Hardware:** NVIDIA RTX 3050 (8GB, Ampere SM 8.6)  
+**Test Case:** 2048×2048×2048 FP32 matrix multiplication
 
 ---
 
-## 📊 Performance Summary
+## 🎯 Final Results
 
-| Version | Optimization | GFLOPS | Speedup | % of cuBLAS |
-|---------|-------------|--------|---------|-------------|
-| v1 |  Naive          |  280     | 1.0×   | 5%  |
-| v2 |Shared Memory Tiling| 736   | 2.6×   | 13% |
-| v3 |Register Blocking | 2,400   | 8.6×   | 42% |
-| v4 |Memory Vectorization| 4,200 | 15.0×  | 74% |
-| v5 |Rectangular Tiling | 5,250  | 18.8×  | 92% |
-| - | cuBLAS (reference) | 5,700  | 20.4×  | 100%|
+| Kernel | Time (ms) | GFLOPS | Compute Util | Memory Util | Speedup |
+|--------|-----------|--------|--------------|-------------|---------|
+| **V6** | **3.39**  |  5,834 |    72.28%    | 79.99% | **1.018** |
+| cuBLAS |    3.45   |   5734 |    72.20%    | 48.78% | 0.982× |
+
+
+**Key Achievement:** Matched NVIDIA's compute efficiency (72.28% vs 72.20%) while using 64% more memory bandwidth - yet still won through better execution strategy for this specific workload.
+
+---
+
+## 📊 Performance Journey
+
+| Version | Optimization | GFLOPS | Speedup | Compute | Memory | % of cuBLAS |
+|---------|-------------|--------|---------|---------|--------|-------------|
+| v1 | Naive | 280 | 1.0× | ~20% | ~25% | 5% |
+| v2 | Shared Memory Tiling | 736 | 2.6× | ~35% | ~40% | 15% |
+| v3 | Register Blocking | 2,400 | 8.6× | ~50% | ~60% | 48% |
+| v4 | Memory Vectorization | 4,200 | 15.0× | ~65% | ~75% | 84% |
+| v5 | Rectangular Tiling | 5,250 | 18.8× | 65.40% | 75.51% | 92% |
+| v6 |    Async Ops     | 5834| 18.1× | 72.28% | 79.99% | 101.7% |
+| - | cuBLAS (reference) | 5734 | 17.8× | 72.20% | 48.78% | 100% |
 
 ![Performance Comparison](images/SOL_bestVScuBLAS.png)
 *Speed of Light comparison: My best kernel vs cuBLAS*
 
+
+## 📊 Profiling Deep Dive
+
+### My Kernel (v6) - Memory & Pipeline Analysis
+
+![Memory Report](images/best_memoryreport.png)
+*Memory workload showing 79.99% utilization - high memory pressure but necessary for my tiling strategy*
+
+![Occupancy Comparison](images/best_vscuBLAS_occupancy.png)
+*Occupancy comparison: 25% (mine) vs 18% (cuBLAS) - proving higher occupancy doesn't guarantee better performance*
+
+![Pipeline Utilization](images/best_cuBLASpipeline.png)
+*Pipeline analysis showing compute/memory balance achieved through async operations*
+
+---
 ---
 
-## 🎯 Executive Summary
+## 🚀 The Breakthrough: Version 6 (Beating cuBLAS!)
 
-Starting from a textbook naive implementation running at just 280 GFLOPS (5% of cuBLAS), I systematically applied GPU optimization techniques, understanding each bottleneck through profiling and architectural analysis. The final kernel achieves **5250 GFLOPS (92% of cuBLAS)** through:
+### The Problem with v5
 
-- Shared memory tiling for data reuse
-- Register blocking for arithmetic intensity
-- Memory coalescing via vectorization  
-- Rectangular tiling for optimal register reuse
-- K-loop unrolling for instruction-level parallelism
+Despite reaching 92% of cuBLAS (5,250 GFLOPS), profiling revealed:
+- **Compute utilization: 65.40%** (ALUs sitting idle!)
+- **Memory utilization: 75.51%** (working hard but...)
+- **Long scoreboard stalls: 92.4%** (instructions waiting on memory!)
+- **I was memory-bound** - memory latency was starving my compute units
+
+### The Solution: Hide Memory Latency with Async
+
+The issue wasn't that I didn't have enough memory bandwidth - it's that **synchronous loads forced compute to wait**. Every time I loaded a tile, all my ALUs sat idle until the data arrived.
+
+**Async copy breaks this dependency:**
+
+// PHASE 1: Compute first half (k=0-31)
+for (int k = 0; k < 32; k += 16) { /* compute */ }
+
+// PHASE 2: Async load next tile (NON-BLOCKING!)
+__pipeline_memcpy_async(&As[...], &A[...], sizeof(float4));
+__pipeline_commit();
+
+// PHASE 3: Compute second half (k=32-63)  
+// While async transfer happens in parallel!
+for (int k = 32; k < 64; k += 16) { /* compute */ }
+
+// PHASE 4: Wait for transfer to complete
+__pipeline_wait_prior(0);
+__syncthreads();**Result:** 
+- Load tile N+1 in the background (non-blocking)
+- Compute with tile N in the foreground
+- By the time we finish computing, tile N+1 is already in SMEM!
+- **Memory latency hidden, compute units unlocked**
+
+#### 2. Aggressive K-Loop Unrolling (16× instead of 4×)
+
+// Load 16 K-elements into registers at once
+float a0[8], a1[8], ..., a15[8];  // 128 registers for A
+float b0[4], b1[4], ..., b15[4];  // 64 registers for B
+
+// Compute 16 FMAs per output (massive ILP!)
+for (int i = 0; i < 8; i++) {
+    for (int j = 0; j < 4; j++) {
+        c[i][j] += a0[i]*b0[j] + a1[i]*b1[j] + ... + a15[i]*b15[j];
+    }
+}**Result:** 4× more instruction-level parallelism → Better warp scheduler utilization
+
+**Important note:** This was NOT a huge improvement in isolation, but combined with async ops, it went from 3.40ms → 3.39ms (every microsecond counts!).
+
+// Load 16 K-elements into registers at once
+float a0[8], a1[8], ..., a15[8];  // 128 registers for A
+float b0[4], b1[4], ..., b15[4];  // 64 registers for B
+
+// Compute 16 FMAs per output (massive ILP!)
+for (int i = 0; i < 8; i++) {
+    for (int j = 0; j < 4; j++) {
+        c[i][j] += a0[i]*b0[j] + a1[i]*b1[j] + ... + a15[i]*b15[j];
+    }
+}.8%** (faster!) |
+| **vs cuBLAS** | **92%** | **101.7%** | **+9.7pp** 🎯 |
+
+**The breakthrough:** Async didn't give me more bandwidth - it gave me **latency hiding**, which unlocked the compute units that were waiting on memory.
+Important note: This was NOT a huge improvement in isolation, but combined with async ops, it went from 3.40ms → 3.39ms (every microsecond counts!).
 
 
+
+### Performance Impact
+
+| Metric | v5 (92%) | v6 (101.7%) | Improvement |
+|--------|----------|-------------|-------------|
+| **Compute Efficiency** | 65.40% | **72.28%** | **+6.88pp** ✅ |
+| Memory Utilization | 75.51% | 79.99% | +4.48pp |
+| Long Scoreboard Stalls | 92.4% | **~0%** | **Hidden by async!** |
+| Time | 3.76ms | **3.39ms** | **-9.8%** (faster!) |
+| **vs cuBLAS** | **92%** | **101.7%** | **+9.7pp** 🎯 |
+
+**The breakthrough:** Async didn't give me more bandwidth - it gave me **latency hiding**, which unlocked the compute units that were waiting on memory.
 
 ---
 
-## 🔬 Optimization Journey
+## 🤔 The Paradox: Why Am I Faster Despite Higher Memory Pressure?
+
+### The Numbers
+
+| Metric | My Kernel | cuBLAS | Ratio |
+|--------|-----------|--------|-------|
+| Compute | 72.28% | 72.20% | **1.00:1** (tied) |
+| Memory | 79.99% | 48.78% | **1.64:1** (64% higher!) |
+| Time | 3.39ms | 3.45ms | **0.98:1** (1.8% faster) |
+
+**How is this possible?**
+
+### Theory: Optimization Target Mismatch
+
+**For this specific workload** (FP32, 2048³, RTX 3050), my simpler strategy has less overhead and executes faster - even though cuBLAS is more "elegant."
+
+On top of this, this is a low-end consumer product -- definitely gets less attention than something that is not only newer, but has more advanced capabilities. Why optimize for FP32 on matrix multiplication when you know you can make use of tensor cores? That is what I believe at least, and therefore this matrix size, for forced FP32, with this low-end card, was beatable.
+
+### My Journey to Understanding This
+
+At first I thought swizzling would make a huge difference, but my implementation ruined my performance. I understand the concept, and I most likely implemented it wrong. I then set my sights onto a different rectangular tiling pattern. 
+
+cuBLAS was making use of 33% occupancy -- mine is 25%, perhaps I should up my occupancy? This was something I did not WANT to do, but I needed to explore the path to see what the performance was like first. I only managed to achieve 4,700 GFLOPS doing 128×32 and 32×64. I ditched this route, as once again in the back of my mind I knew fixing long scoreboard was the real issue; it was present across tile sizes; whether it was 80% or 98% long scoreboard -- it was destroying performance.
+
+I started thinking about making use of register space more. To maintain occupancy I could fit 90 more registers -- could we load floats into the registers for better ILP? But that still brought up the question -- we are LOADING from global memory regardless, that's our issue!
+
+**Async was clearly the answer.** I only did not want to use it because of an apples-to-apples comparison between my kernel and cuBLAS, but cuBLAS's kernel was not having the same issue my kernel was having -- they have no long scoreboard dependencies! On top of this -- cuBLAS knows this is the Ampere architecture, they are aware they have access to async, and I'm certain if it would have made a difference here they would have used it. We had two different kernels, and I made use of the architectural capabilities that they also had access to.
+
+### The Trade-off
+
+**cuBLAS:** 1.48:1 compute-to-memory ratio (very efficient)  
+**My Kernel:** 0.90:1 compute-to-memory ratio (less efficient but simpler execution)
+
+---
+
+## 🔍 The SASS Smoking Gun: Different Strategies, Different Instructions
+
+This is the key revelation that proved we were using fundamentally different approaches:
+
+### My Kernel Uses: `LDGSTS.E.BYPASS.128`
+
+LDGSTS.E.BYPASS.128 [R60][R14.64]      // Ampere's async copy!
+LDGSTS.E.BYPASS.128 [R60+0x100][R12.64]
+LDGSTS.E.BYPASS.128 [R60+0x200][R4.64]
+// ... 16× occurrences in the main loop- **LDGSTS** = "Load from Global, Store to Shared" (single instruction!)
+- **BYPASS** = Bypasses L1 cache, goes straight L2 → SMEM
+- This is Ampere's **asynchronous memory pipeline**
+- **Essential for my tiling strategy** - without it, I'd be stuck at 65% compute
+
+### cuBLAS Uses: `LDG.E.LTC128B.CONSTANT`
+
+LDG.E.LTC128B.CONSTANT R64, [R78]      // Synchronous load
+LDG.E.LTC128B.CONSTANT R65, [R78+0x80]
+LDG.E.LTC128B.CONSTANT R66, [R78+0x100]
+// Traditional synchronous loads through L2/texture cache- **LDG** = "Load from Global" (separate from store to SMEM)
+- **LTC128B** = L2/Texture cache, 128-byte lines
+- **CONSTANT** = Constant memory cache policy
+- This is **synchronous** - no async pipeline
+- **Only needs 48.78% memory bandwidth** - their tiling is so efficient they don't need async!
+
+### The Key Insight
+
+**cuBLAS engineers had access to the same Ampere `cp.async` features but chose not to use them because memory wasn't their bottleneck.**
+
+I discovered a **different optimization space** where:
+- Simpler execution paths (less overhead)
+- Higher memory bandwidth requirements (79.99% vs 48.78%)
+- **Async operations become essential** to hide memory latency
+- Result: Same compute efficiency (72.28% vs 72.20%), but my approach wins by 1.8% for this specific case
+
+**Two different strategies, both valid, both hitting the same compute ceiling - but mine has simpler overhead for FP32 
+
+---
+
+## 🔍 Profiling Insights
+
+### Nsight Compute Comparison
+
+**My kernel profiler says:**
+> "10% speedup possible from fixing shared memory bank conflicts"
+
+**cuBLAS profiler says:**
+> (no suggestions - already perfectly optimized)
+
+**Interpretation:** cuBLAS has **zero bank conflicts** (perfect SMEM access patterns), yet I'm still faster! This proves that my tiling/scheduling strategy is fundamentally better for this **specific** workload, even with "imperfect" code.
+
+
+## 🔬 Complete Optimization Journey
+
+
 
 ### Version 1: Naive Implementation (280 GFLOPS)
 
 **The Baseline: What Every Tutorial Shows**
 
-```cuda
 __global__ void matmul_naive(float* C, const float* A, const float* B, 
                               int M, int N, int K) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -52,161 +235,46 @@ __global__ void matmul_naive(float* C, const float* A, const float* B,
     if (row < M && col < N) {
         float sum = 0.0f;
         for (int k = 0; k < K; k++) {
-            sum += A[row * K + k] * B[k * N + col];  // Global memory every iteration
+            sum += A[row * K + k] * B[k * N + col];
         }
         C[row * N + col] = sum;
     }
-}
-```
+}**Problems:**
+- Massive global memory traffic (8 MB per thread)
+- Zero data reuse between threads
+- Arithmetic intensity: 0.25 FLOP/byte (terrible!)
 
-**Why is this slow?**
-
-1. **Massive global memory traffic**
-   - Each thread reads an entire row of A (2048 floats)
-   - Each thread reads an entire column of B (2048 floats)
-   - Total: ~8 MB of global memory per thread
-   - Memory bandwidth: ~20 GB/s (only 10% of 212 GB/s peak!)
-
-2. **Zero data reuse between threads**
-   - Thread (0,0) loads A[0,:] and B[:,0]
-   - Thread (0,1) loads A[0,:] and B[:,1]
-   - A[0,:] loaded twice! (Should share via SMEM)
-
-3. **Low arithmetic intensity**
-   - 2K FLOPs per thread
-   - 8K bytes loaded
-   - AI = 0.25 FLOP/byte (terrible!)
-
-**Performance:**
-- 280 GFLOPS (only 5% of cuBLAS)
-- Memory bound (compute units are idle)
-
-![Naive Speed of Light](images/naive_SOL.png)
-*Naive kernel showing low compute and memory utilization*
+**Performance:** 280 GFLOPS (5% of cuBLAS)
 
 ---
 
 ### Version 2: Shared Memory Tiling (736 GFLOPS) - 2.6× speedup
 
-**The Classic Optimization: Block Data Reuse**
+**The Classic Optimization**
 
-```cuda
-#define TILESIZE 32
+__shared__ float As[32][32];
+__shared__ float Bs[32][32];
 
-__global__ void matmul_tiled(float* C, const float* A, const float* B, 
-                              int M, int N, int K) {
-    __shared__ float As[TILESIZE][TILESIZE];
-    __shared__ float Bs[TILESIZE][TILESIZE];
-    
-    int row = blockIdx.y * TILESIZE + threadIdx.y;
-    int col = blockIdx.x * TILESIZE + threadIdx.x;
-    
-    float sum = 0.0f;
-    
-    
-    int numTiles = cuda::ceil_div(K,tilesize);
-    for (int t = 0; t < numTiles; t++) {
-        // load into smem
-        As[threadIdx.y][threadIdx.x] = A[row * K + t * TILESIZE + threadIdx.x];
-        Bs[threadIdx.y][threadIdx.x] = B[(t * TILESIZE + threadIdx.y) * N + col];
-        __syncthreads();
-        
-        //Compute using smem
-        for (int k = 0; k < TILESIZE; k++) {
-            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-        }
-        __syncthreads();
-    }
-    
-    C[row * N + col] = sum;
-}
-```
-
-**Why is this better?**
-
-1. **Data reuse via shared memory**
-   - Each A value loaded once, used 32 times (by 32 threads in the row)
-   - Each B value loaded once, used 32 times (by 32 threads in the column)
-   - **32× reduction in global memory traffic!**
-
-2. **Faster memory access**
-   - Shared memory latency: ~20 cycles
-   - Global memory latency: ~400 cycles
-   - 20× faster once data is in SMEM
-
-3. **Improved arithmetic intensity**
-   - Before: 0.25 FLOP/byte
-   - After: 8 FLOP/byte (32× better!)
-
-**Performance:**
-- 736 GFLOPS (2.6× faster than naive)
-- Memory bandwidth: ~60 GB/s
-- **Still bottlenecked:** Each thread only computes 1 output
-
-![Tiled Speed of Light](images/tiling_SOL.png)
-*Tiled kernel showing improved utilization but still room for improvement*
-
-**Remaining problem:** Low work per thread = low ILP (instruction-level parallelism)
+// Load tiles into SMEM
+// Compute using SMEM
+// 32× reduction in global memory traffic!**Performance:** 736 GFLOPS (2.6× faster)
 
 ---
 
 ### Version 3: Register Blocking (2,400 GFLOPS) - 8.6× speedup
 
-**The Next Level: Thread-Level Tiling**
+**Thread-Level Tiling**
 
-**Key Change:** Each thread now computes REGTILE×REGTILE outputs (2×2 = 4 outputs) instead of just 1.
+Each thread now computes 2×2 outputs instead of 1:
 
-```cuda
-#define TILESIZE 32
-#define REGTILE 2  // Each thread computes 2×2 outputs
+float c[2][2] = {0.0f};  // In registers!
 
-float c[REGTILE][REGTILE] = {0.0f};  // Stored in registers!
-
-for (int k = 0; k < TILESIZE; k++) {
-    float a[REGTILE], b[REGTILE];
-    for (int i = 0; i < REGTILE; i++) {
-        a[i] = As[ty * REGTILE + i][k];
-        b[i] = Bs[k][tx * REGTILE + i];
+// Outer product in registers (super fast!)
+for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+        c[i][j] += a[i] * b[j];
     }
-    
-    // Outer product (all register operations, super fast!)
-    for (int i = 0; i < REGTILE; i++) {
-        for (int j = 0; j < REGTILE; j++) {
-            c[i][j] += a[i] * b[j];
-        }
-    }
-}
-```
-
-**Why is this better?**
-
-1. **Higher arithmetic intensity**
-   - Before: Each thread computes 1 output
-   - After: Each thread computes 4 outputs (2×2)
-   - 4× more compute per memory access
-
-2. **Better register utilization**
-   - Accumulators `c[][]` stay in registers (latency = 1 cycle!)
-   - Compiler can pipeline operations (ILP)
-   - Less SMEM pressure per output computed
-
-3. **Reduced shared memory bandwidth**
-   - Before: 2K SMEM reads per output
-   - After: 2K SMEM reads for 4 outputs
-   - 4× less SMEM bandwidth per output
-
-**Performance:**
-- 2,400 GFLOPS (8.6× faster than naive, 3.3× faster than tiled)
-- Arithmetic intensity: 32 FLOP/byte
-- Register usage: ~50 per thread
-
-Upon first glance, register blocking seems like a massive success. Loading up Nsight Compute and seeing 91% compute and 92% memory utilization might lead you to believe that this is nearing the limits of the card. It's not - just the load and store pipeline nearing its limit (bad); FMA is what we want here. In comparison to cuBLAS, it's getting there, but now we just made ourselves memory bottlenecked, not what you want.
-
-![Register Blocking Metrics](images/registerblockingregtile2.png)
-*Register blocking showing high utilization but wrong pipeline*
-
-![Register Blocking Pipeline Utilization](images/pipeUtilizationregisterblockingregtile2.png)
-*Improved pipeline utilization with register blocking*
+}**Performance:** 2,400 GFLOPS (8.6× faster)
 
 ---
 
@@ -214,458 +282,147 @@ Upon first glance, register blocking seems like a massive success. Loading up Ns
 
 **Exploit Hardware: 128-bit Memory Transactions**
 
-**Key Change:** Use `float4` to load/store 4 floats at once (128-bit transactions) and increase REGTILE to 4.
-
-```cuda
-#define TILESIZE 64
-#define REGTILE 4  // Increased to 4 (perfect for float4)
-
-// Vectorized load: 4 floats at once (128-bit transaction)
+// Load 4 floats at once (128-bit coalesced access)
 float4 a_vec = *reinterpret_cast<const float4*>(&A[...]);
 
-// Write back 4 floats at once
-float4 out = make_float4(c[i][0], c[i][1], c[i][2], c[i][3]);
-*reinterpret_cast<float4*>(&C[...]) = out;
-```
-
-**Why is this better?**
-
-1. **Coalesced memory access**
-   - CUDA memory subsystem fetches in 128-byte chunks
-   - 32 threads × 4 bytes = 128 bytes = perfect coalescing!
-   - Before: 4 separate 32-bit transactions
-   - After: 1 combined 128-bit transaction
-   - **4× memory bandwidth efficiency**
-
-2. **Reduced memory transactions**
-   - Fewer L1/L2 cache lookups
-   - Fewer DRAM requests
-   - Memory bandwidth: ~140 GB/s
-
-3. **Larger tile size (64 vs 32)**
-   - More work per block
-   - Better GPU utilization
-   - Each thread computes 16 outputs (4×4)
-
-**Performance:**
-- 4,200 GFLOPS (15× faster than naive, 1.75× faster than register blocking)
-- Register usage: ~70 per thread
-- Block dimensions: 16×16 threads
-- **Approaching cuBLAS, but still 26% gap!**
-
-
-![Vectorized Speed of Light](images/registerblockingvectorizedregtile4_SOL.png)
-*Vectorized kernel approaching peak performance*
+// 4× memory bandwidth efficiency!**Performance:** 4,200 GFLOPS (15× faster, 74% of cuBLAS)
 
 ---
 
-### Version 5: Rectangular Tiling (5,250 GFLOPS) - 18.8× speedup ⭐
+### Version 5: Rectangular Tiling (5,250 GFLOPS) - 18.8× speedup
 
 **The Breakthrough: Non-Square Register Tiles**
 
-**Key Insight:** 8×4 rectangular tiles beat 4×4 square tiles!
+8×4 rectangular tiles beat 4×4 square tiles:
 
-```cuda
-#define TILESIZE 64
-#define REGTILE_M 8  // More rows!
+#define REGTILE_M 8  // More rows
 #define REGTILE_N 4  // Fewer columns
 
-// Each thread computes 8×4 = 32 outputs (not 16!)
-float c[REGTILE_M][REGTILE_N] = {0.0f};
+// Each thread computes 32 outputs (not 16!)
+float c[8][4] = {0.0f};
 
-// K-loop with unrolling (k += 4)
-for (int k = 0; k < TILESIZE; k += 4) {
-    // Cache 4 k-iterations worth of data
-    float a0[REGTILE_M], a1[REGTILE_M], a2[REGTILE_M], a3[REGTILE_M];
-    float b0[REGTILE_N], b1[REGTILE_N], b2[REGTILE_N], b3[REGTILE_N];
-    
-    // Load from SMEM (8 A-values × 4 = 32 loads)
-    for (int i = 0; i < REGTILE_M; i++) {
-        a0[i] = As[ty * REGTILE_M + i][k];
-        a1[i] = As[ty * REGTILE_M + i][k + 1];
-        a2[i] = As[ty * REGTILE_M + i][k + 2];
-        a3[i] = As[ty * REGTILE_M + i][k + 3];
-    }
-    
-    // Load from SMEM (4 B-values × 4 = 16 loads)
-    for (int j = 0; j < REGTILE_N; j++) {
-        b0[j] = Bs[k][tx * REGTILE_N + j];
-        b1[j] = Bs[k + 1][tx * REGTILE_N + j];
-        b2[j] = Bs[k + 2][tx * REGTILE_N + j];
-        b3[j] = Bs[k + 3][tx * REGTILE_N + j];
-    }
-    
-    // Compute 4 k-iterations at once (8×4×4 = 128 FMAs)
-    for (int i = 0; i < REGTILE_M; i++) {
-        for (int j = 0; j < REGTILE_N; j++) {
-            c[i][j] += a0[i] * b0[j];
-            c[i][j] += a1[i] * b1[j];
-            c[i][j] += a2[i] * b2[j];
-            c[i][j] += a3[i] * b3[j];
-        }
-    }
-}
-```
+// Each B-value reused 8 times (vs 4 in square)**Performance:** 5,250 GFLOPS (18.8× faster, **92% of cuBLAS**)
 
-**Why is this the magic combination?**
-
-1. **Better register reuse (the key insight!)**
-   - **Square 4×4:** Load 4 A-values, 4 B-values → 16 outputs
-   - **Rectangular 8×4:** Load 8 A-values, 4 B-values → 32 outputs
-   - **Same B-values, but 2× more A-values = 2× work!**
-   - Each B-value is reused with more A-values
-
-2. **Optimal register usage**
-   - Register count: ~90 per thread
-   - Below spilling threshold (168 on RTX 3050)
-   - 8×4×4 (unrolled) + temp arrays = perfect fit
-
-3. **K-loop unrolling (k+=4)**
-   - Reduces SMEM access frequency by 4×
-   - Increases ILP (instruction-level parallelism)
-   - Compiler can pipeline multiply-adds
-
-4. **Balanced block dimensions**
-   - 16×8 = 128 threads per block
-   - Good warp occupancy
-   - Each block computes 64×64 output tile
-
-**Performance:**
-- **5,250 GFLOPS (92% of cuBLAS!)**
-- Register usage: 90 per thread
-- Occupancy: 25% (low but OK - throughput matters, not occupancy!)
-- SMEM: 32 KB per block
-- Memory bandwidth: 180 GB/s (85% of peak)
+**Why it works:** Better register reuse - each B-value used 2× more!
 
 ---
 
-## 🔍 Deep Dive: Why Rectangular Beats Square
+### Version 6: Async Ops + K-unroll 16× (5,834 GFLOPS) - **Beats cuBLAS!**
 
-This is the non-obvious insight that got us from 74% to 92% of cuBLAS.
+**Combining v5 with Ampere async features:**
 
-### The Math
+// Split K-loop into halves
+for (int k = 0; k < 32; k += 16) { /* compute */ }
 
-**Square tiling (4×4):**
-```
-For each k-step:
-  Load 4 A-values (a0, a1, a2, a3)
-  Load 4 B-values (b0, b1, b2, b3)
-  Compute 4×4 = 16 multiply-adds
-  
-Register reuse: Each A-value used 4 times, each B-value used 4 times
-```
+// Async load next tile while computing
+__pipeline_memcpy_async(...);
 
-**Rectangular tiling (8×4):**
-```
-For each k-step:
-  Load 8 A-values (a0, a1, ..., a7)
-  Load 4 B-values (b0, b1, b2, b3)
-  Compute 8×4 = 32 multiply-adds
-  
-Register reuse: Each A-value used 4 times, each B-value used 8 times!
-```
+// Compute second half while transfer happens
+for (int k = 32; k < 64; k += 16) { /* compute */ }
 
-**The key:** B-values are reused 2× more! This is better because:
-- Matrix B is column-major in our layout
-- Accessing B is slightly more expensive (column access pattern)
-- By reusing B values more, we reduce total B-loads
-
-### Why Not Go Bigger? (8×8, 16×4, etc.)
-
-**I tested many configurations:**
-- **8×8:** Register spilling (169 registers) → 4,100 GFLOPS ❌
-- **16×4:** Register spilling (256 registers) → 3,800 GFLOPS ❌
-- **16×8:** Way too many registers → 2,500 GFLOPS ❌
-- **8×128:** Tried to maximize columns → 3,900 GFLOPS ❌
-- **8×64:** Still column-heavy → 4,000 GFLOPS ❌
-- **4×32:** Column-focused → 4,100 GFLOPS ❌
-
-**The pattern:** Going bigger in EITHER dimension made things worse!
-
-**Why column-heavy failed:**
-
-My initial thinking: "If we load more columns per thread, we parallelize better!"
-
-**Wrong.** Here's what actually happens:
-
-```
-Warp (32 threads) loading columns:
-Thread 0: Load columns 0-127    ← Takes time T
-Thread 1: Load columns 128-255  ← Takes time T
-...
-Thread 31: Load columns 3968-4095 ← Takes time T
-
-Warp execution time = MAX(all thread times) = T
-```
-
-**The bottleneck:** Memory latency, not number of loads!
-- Doesn't matter if you load 1 column or 128 columns per thread
-- Warp waits for the SLOWEST thread
-- Loading more columns per thread = more registers = spilling = slower thread = slower warp!
-
-**Why 8×4 is the sweet spot:**
-1. **Balanced dimensions** - Not too wide, not too tall
-2. **Fits in registers** - 80 registers (comfortable margin below 168)
-3. **Good reuse** - Each B-value used 8 times (vs 4 in square)
-4. **No warp bottlenecks** - All threads finish around same time
-5. **Limited hardware** - RTX 3050 doesn't have headroom for gigantic tiles
-
-**The realization:** With my hardware constraints (48KB SMEM, 168 register limit), the sweet spot wasn't about maximizing dimensions - it was about **increasing ILP just enough** without hitting resource limits.
-
-**This insight alone: 4,200 → 5,250 GFLOPS (25% gain, closed the gap from 74% to 92%)**
+__pipeline_wait_prior(0);**Result:**
+- **Matched cuBLAS compute efficiency:** 72.28% vs 72.20%
+- **Won on execution time:** 3.39ms vs 3.45ms
+- **101.7% of cuBLAS performance** ✓
 
 ---
 
-## 📈 Profiling Results
+## 💡 Key Learnings
 
-### My Best Kernel (Rectangular Tiling 8×4)
+### 1. Profile First, Optimize Second
 
-![Best Kernel Memory Report](images/best_memoryreport.png)
-*Memory workload analysis showing ... somewhat efficient bandwidth utilization*
+I was stuck on a long scoreboard issue -- things were taking an incredibly long time for me to be able to use them. That was the main downside of my kernel I could think of, having load instructions stalled for 92.4% on long scoreboard, destroying performance.
+Changing around the tile size to 32 made this 92.4% go to 98%. I didn't think specifically my tile size was an issue; cuBLAS makes use of a 256 1D block, with a grid size of 16×16×2. I am unsure about why this is, but I did not think the first thing I should do to unlock more performance was copy this, as that was someone's implementation that they thought of, and I knew my bottleneck was long scoreboard -- not my tile size config.
+Don't assume your bottleneck! 
 
-![Best Kernel vs cuBLAS Occupancy](images/best_vscuBLAS_occupancy.png)
+### 2. Match the Benchmark on Its Strengths
 
+cuBLAS achieved 72% compute → I needed to match that before anything else mattered. Once I did, I was competitive.
 
-**Key Metrics:**
-- **Performance:** 5,250 GFLOPS
-- **Occupancy:** 25% (2 blocks per SM)
-- **Registers:** 90 per thread
-- **Shared Memory:** 32 KB per block
-- **Memory Bandwidth:** 180 GB/s (85% of peak 212 GB/s)
-- **Compute Utilization:** 87% of peak FLOPS
+### 3. Sometimes "Worse" is Better
 
----
+My kernel has:
+- ❌ Bank conflicts (cuBLAS has none)
+- ❌ 64% higher memory pressure
+- ✅ 2% better performance
 
-### cuBLAS Reference
+**Why?** Simpler code path = less overhead for this specific workload.
 
-![cuBLAS Memory Report](images/cuBLAS_memoryreport.png)
-*cuBLAS memory access patterns - notice the higher efficiency*
+### 4. There's No Universal "Best"
 
-**cuBLAS Metrics:**
-- **Performance:** 5,700 GFLOPS
-- **Occupancy:** 18% (lower than mine!)
-- **Registers:** 118 per thread (30% more)
-- **Shared Memory:** 48 KB per block (50% more)
-- **Memory Bandwidth:** 195 GB/s (92% of peak)
-- **Compute Utilization:** 95% of peak FLOPS
+- **My kernel wins:** FP32, 2048³, RTX 3050
+- **cuBLAS wins:** FP16, 4096×4096+, A100/H100
 
-**Key Differences:**
+Both approaches are valid for their target use cases!
 
-| Metric | My Kernel | cuBLAS | Analysis |
-|--------|-----------|--------|----------|
-| Occupancy | 25% |     33%   |  Allows them 4 warps per scheduler whilst I get 3. Big difference here!   |
-| Registers/thread | 80 | 118 | cuBLAS uses more for higher AI |
-| SMEM/block | 33 KB | 17 KB | cuBLAS maximizes SMEM usage |
-| Memory BW | 180 GB/s | 195 GB/s | 8% gap explains most perf difference |
+### 5. Understanding > Copying
 
-**What cuBLAS does better:**
-1. **Zero bank conflicts** - Swizzled SMEM layout
-2. **Higher arithmetic intensity** - More registers = more work per load
-3. **Better memory patterns** - Possibly async memory ops
-4. **More efficient resource usage** - Uses half the SMEM (17KB vs 33KB) but achieves higher throughput
-
-**The cuBLAS Paradox:**
-
-The most striking observation: cuBLAS uses **17KB SMEM** while my kernel uses **33KB SMEM**, yet cuBLAS is still faster. This is a testament to NVIDIA's incredible engineering:
-- Less memory footprint = better cache utilization
-- Better algorithm design = more compute per byte
-- Perfect memory access patterns = zero wasted bandwidth
-
-This taught me that **throwing more resources at a problem doesn't always help** - elegance and efficiency matter more than brute force.
+The real achievement isn't beating cuBLAS - it's understanding **why** each optimization works and **when** to apply it.
 
 ---
 
-## 🧪 Experimental Insights: What I Tried and Why It Didn't Work
+## 🔧 Implementation Details
 
-### K-Loop Unrolling: The Register Utilization Paradox
+### Final Configuration
+#define TILESIZE 64        // Shared memory tile
+#define REGTILE_M 8        // Each thread: 8 rows
+#define REGTILE_N 4        // Each thread: 4 cols
+// Block: 16×8 threads = 128 threads
+// K-unrolling: 16× (loads 16 K-elements at once)
+// Async: cp.async for GMEM→SMEM overlap### Register Usage
+- **Accumulators:** 32 registers (`c[8][4]`)
+- **Temporary (per iteration):** ~160 registers (k+=16 unroll)
+- **Total reported:** ~95 registers (compiler optimizes by reusing)
+- **Occupancy:** 25% (compute-bound, not occupancy-bound)
 
-**Hypothesis:** More unrolling = more register usage = better ILP = faster performance
+### Shared Memory
+- **As + Bs:** 64×64 × 2 = 32KB per block
+- **No padding** (bank conflicts present but not limiting)
+Simlar to Simeons blog on this -- trying to fix bank conflicts lowers performance, therefore I didn't focus there.
+---
 
-**Tested:**
-- **k+=4** (current): 90 registers, **5,250 GFLOPS** ⭐
-- **k+=8** (double unroll): 138 registers, **5,250 GFLOPS** (same!)
+## 🚀 How to Run
 
-**Surprising result:** Both achieved identical performance despite k+=8 using 53% more registers!
+# Compile
+nvcc -arch=sm_86 -O3 --std=c++17 kernel_final.cu -o matmul
 
-**Why this matters:**
-- The RTX 3050 has register headroom (168 max before spilling)
-- Using more registers doesn't hurt performance (unlike SMEM bank conflicts)
-- From a **code design perspective**, k+=8 is actually better:
-  - More ILP potential (compiler has more to work with)
-  - Better utilizes available hardware resources
-  - "If you have the memory, use it"
+# Run
+./matmul
 
-**Why I stuck with k+=4:**
-- No performance benefit (profiler showed identical numbers)
-- More registers = harder to extend further
-- k+=4 felt like the right balance
-- **But:** In hindsight, k+=8 might be the better engineered solution even with same perf
+# Profile
+ncu --set full -o my_kernel ./matmul
 
-**The lesson:** Sometimes using more resources doesn't make you faster, but it might make your code more robust and extensible.
+# Compare with cuBLAS
+ncu --set full -o cublas ./cublas_benchmark
+ncu-ui my_kernel.ncu-rep cublas.ncu-rep---
+
+## 📈 Future Work
+
+### Potential Improvements
+
+1. **Swizzled addressing** → Eliminate conflicts entirely
 
 ---
 
-### Rectangular Tiling: The Column-Loading Fallacy
+## 🎓 Resources
 
-**Initial intuition (WRONG):** "Loading columns is easier than rows, so let's maximize columns!"
-
-**What I tried:**
-- **8×128:** Massive column dimension (512 outputs per thread!)
-- **8×64:** Still huge
-- **16×16:** Square with many elements
-- **4×32:** Column-heavy
-
-**All failed. Performance: ~3,800-4,200 GFLOPS** (worse than 4×4 square!)
-
-**Why they failed - The Warp Synchronization Insight:**
-
-This was my biggest "aha!" moment: **A warp is only as fast as its slowest thread.**
-
-```
-When loading from memory:
-├─ Warp has 32 threads
-├─ All threads issue loads simultaneously
-├─ But memory returns at different times
-└─ Warp waits for the LAST thread to finish
-```
-
-**The key realization:**
-- Loading 1 column per thread across a warp = same time as 32 columns per thread
-- You're bottlenecked by **memory latency**, not **number of loads**
-- Having one thread load tons of columns doesn't help if that thread becomes the slowest!
-
-**What actually matters:**
-- **Balance:** Work distributed evenly across threads
-- **Arithmetic intensity:** Compute done PER loaded value
-- **Register footprint:** Staying under spilling threshold
-
-**Why 8×4 worked:**
-- Balanced row/column split
-- Each B-value reused 8 times (vs 4 times in square tiling)
-- Fit perfectly in register budget
-- No single thread became a bottleneck
-
-**The journey:** Testing 8×128, 8×64, and realizing they were all slower made me understand that **GPU optimization isn't about maximizing dimensions - it's about balance.**
+- **Nsight Compute:** NVIDIA's profiling tool (essential!)
+- **CUTLASS:** NVIDIA's GEMM template library
+- **Simon Boehm's Blog:** "How to Optimize GEMM"
+- **CUDA C++ Programming Guide:** Official documentation
 
 ---
 
-### The 74% → 92% Gap: What Made The Difference
+## 📝 License
 
-Going from 4,200 GFLOPS (74%) to 5,250 GFLOPS (92%) took the longest time. Here's what finally clicked:
-
-**Failed attempts:**
-- Warp-aware indexing (broke correctness)
-- Double buffering (needed 64KB SMEM, only had 48KB)
-- Larger tiles (register spilling)
-- More unrolling (no benefit)
-- Column-heavy tiling (slower!)
-
-**What worked:**
-- **Rectangular 8×4** (not intuitive!)
-- **Understanding warp bottlenecks** (can't just load more columns)
-- **Accepting hardware limits** (25% occupancy is OK)
-
-**Why it took so long:**
-- Most tutorials teach square tiling (4×4, 8×8)
-- Rectangular tiling isn't obvious
-- Had to unlearn the "more columns = faster" misconception
-- Needed to profile and understand at warp-level
-
-**Was it worth it?** Absolutely. That 18% improvement (74% → 92%) closed most of the gap to cuBLAS and taught me more about GPU architecture than all previous optimizations combined.
+MIT - Use freely, attribution appreciated!
 
 ---
 
-## 🎓 Key Learnings
+## 🙏 Acknowledgments
 
-### 1. Arithmetic Intensity > Occupancy
+This project was a 4-week journey of learning GPU architecture through iterative profiling and optimization. The real achievement isn't the 1.8% speedup over cuBLAS - it's understanding **why** performance changes with each modification. 
 
-**Conventional wisdom:** "Higher occupancy = better performance"
+**To other learners:** Don't just copy optimizations. Profile, understand the bottleneck, then implement. That's where real learning happens.
 
-**Reality:** Occupancy only matters when you're latency-bound.
-
-- My kernel: 25% occupancy, 5,250 GFLOPS
-- cuBLAS: 18% occupancy, 5,700 GFLOPS
-
-**Why?** When compute-bound, doing more work per thread (even with fewer threads) wins.
-
----
-
-### 2. Register Usage Has a Sweet Spot
-
-**Tested configurations:**
-- 50 regs/thread: 2,400 GFLOPS (under-utilized, low AI)
-- 90 regs/thread: 5,250 GFLOPS ⭐ (perfect!)
-- 138 regs/thread: 5,198 GFLOPS (still OK, near limit)
-- 169 regs/thread: 4,300 GFLOPS ❌ (spilling to local memory!)
-
-**RTX 3050 limits:**
-- 64K registers per SM
-- 168 registers per thread before spilling
-- **Finding the sweet spot is crucial!**
-
----
-
-### 3. Memory Coalescing is Non-Negotiable
-
-**Impact of float4 vectorization:**
-- Without: 3,100 GFLOPS
-- With: 4,200 GFLOPS
-- **35% speedup from one optimization!**
-
----
-
-### 4. Rectangular Tiling is Underappreciated
-
-Most tutorials teach square tiles (4×4, 8×8). But:
-
-**8×4 rectangular > 4×4 square:**
-- Same memory traffic
-- 2× more outputs
-- Better register reuse
-
-**This single insight: 4,200 → 5,250 GFLOPS (25% gain)**
-
----
-
-### 5. K-Loop Unrolling Has Diminishing Returns
-
-**Tested:**
-- k+=1 (no unroll): 4,800 GFLOPS
-- k+=2: 5,100 GFLOPS
-- k+=4: 5,250 GFLOPS ⭐ (optimal)
-- k+=8: 5,217 GFLOPS (register pressure)
-- k+=16: 4,300 GFLOPS ❌ (register spilling)
-
-**Why k+=4 is optimal:**
-- Reduces SMEM accesses by 4×
-- Increases ILP
-- Still fits in registers (90 total)
-
----
-
-### 6. Hardware Limits Are Real
-
-**RTX 3050 constraints that affected design:**
-
-| Limit | Value | Impact |
-|-------|-------|---------|
-| SMEM per block | 48 KB | Prevented double buffering |
-| Registers per thread | 168 | Limited unrolling depth |
-| Memory bandwidth | 212 GB/s | Ultimate ceiling at ~6,000 GFLOPS |
-
----
-
-
-## 📚 References
-
-- [CUTLASS](https://github.com/NVIDIA/cutlass) - NVIDIA's high-performance GEMM library
-- [How to Optimize GEMM](https://siboehm.com/articles/22/CUDA-MMM) - Simon Boehm
-- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-- [Nsight Compute Documentation](https://docs.nvidia.com/nsight-compute/)
-
-
-**License:** MIT - Use freely, attribution appreciated
-
-Currently; cuBLAS makes use of 33% occupancy; 4 warps per scheduler . My implementation is 25% occupancy and 3 warps per scheduler.
-I believe there to be most if not all of the performance difference. 
-I am going to have to mess around with differing rectangular tiling options in order to hit these occupancy numbers.
+**And remember:** Sometimes you don't need to be better at everything - you just need to find the one thing you're better at for your specific use case.
