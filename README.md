@@ -56,14 +56,14 @@ A deep dive into GPU optimization techniques, progressively improving a naive GE
 ### The Problem with v5
 
 Despite reaching 92% of cuBLAS (5,250 GFLOPS), profiling revealed:
-- **Compute utilization: 65.40%** (ALUs sitting idle!)
+- **Compute utilization: 65.40%** (CUDA cores sitting idle!)
 - **Memory utilization: 75.51%** (working hard but...)
 - **Long scoreboard stalls: 92.4%** (instructions waiting on memory!)
 - **I was memory-bound** - memory latency was starving my compute units
 
 ### The Solution: Hide Memory Latency with Async
 
-The issue wasn't that I didn't have enough memory bandwidth - it's that **synchronous loads forced compute to wait**. Every time I loaded a tile, all my ALUs sat idle until the data arrived.
+The issue wasn't that I didn't have enough memory bandwidth - it's that **synchronous loads forced compute to wait**. Every time I loaded a tile, all my CUDA cores sat idle until the data arrived.
 
 **Async copy breaks this dependency:**
 
