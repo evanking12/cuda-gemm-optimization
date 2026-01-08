@@ -344,7 +344,7 @@ cuBLAS achieved 72% compute → I needed to match that before anything else matt
 My kernel has:
 - ❌ Bank conflicts (cuBLAS has none)
 - ❌ 64% higher memory pressure
-- ✅ 2% better performance
+- ✅ 1.8% better performance
 
 **Why?** Simpler code path = less overhead for this specific workload.
 
@@ -369,7 +369,7 @@ The real achievement isn't beating cuBLAS - it's understanding **why** each opti
 #define REGTILE_N 4        // Each thread: 4 cols
 // Block: 16×8 threads = 128 threads
 // K-unrolling: 16× (loads 16 K-elements at once)
-// Async: cp.async for GMEM→SMEM overlap### Register Usage
+// Async: cp.async for GMEM→SMEM overlap
 - **Accumulators:** 32 registers (`c[8][4]`)
 - **Temporary (per iteration):** ~160 registers (k+=16 unroll)
 - **Total reported:** ~95 registers (compiler optimizes by reusing)
@@ -381,22 +381,6 @@ The real achievement isn't beating cuBLAS - it's understanding **why** each opti
 Simlar to Simeons blog on this -- trying to fix bank conflicts lowers performance, therefore I didn't focus there.
 ---
 
-## 🚀 How to Run
-
-# Compile
-nvcc -arch=sm_86 -O3 --std=c++17 kernel_final.cu -o matmul
-
-# Run
-./matmul
-
-# Profile
-ncu --set full -o my_kernel ./matmul
-
-# Compare with cuBLAS
-ncu --set full -o cublas ./cublas_benchmark
-ncu-ui my_kernel.ncu-rep cublas.ncu-rep---
-
-## 📈 Future Work
 
 ### Potential Improvements
 
@@ -409,6 +393,7 @@ ncu-ui my_kernel.ncu-rep cublas.ncu-rep---
 - **Nsight Compute:** NVIDIA's profiling tool (essential!)
 - **CUTLASS:** NVIDIA's GEMM template library
 - **Simon Boehm's Blog:** "How to Optimize GEMM"
+- **aleksagordic.com/blog/matmul** Great resource for more advanced matrixMul
 - **CUDA C++ Programming Guide:** Official documentation
 
 ---
@@ -419,7 +404,7 @@ MIT - Use freely, attribution appreciated!
 
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 This project was a 4-week journey of learning GPU architecture through iterative profiling and optimization. The real achievement isn't the 1.8% speedup over cuBLAS - it's understanding **why** performance changes with each modification. 
 
