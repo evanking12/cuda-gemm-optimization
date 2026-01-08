@@ -86,6 +86,10 @@ __syncthreads();**Result:**
 - By the time we finish computing, tile N+1 is already in SMEM!
 - **Memory latency hidden, compute units unlocked**
 
+
+**The breakthrough:** Async didn't give me more bandwidth - it gave me **latency hiding**, which unlocked the compute units that were waiting on memory.
+
+
 #### 2. Aggressive K-Loop Unrolling (16× instead of 4×)
 
 // Load 16 K-elements into registers at once
@@ -113,8 +117,7 @@ for (int i = 0; i < 8; i++) {
 }.8%** (faster!) |
 | **vs cuBLAS** | **92%** | **101.7%** | **+9.7pp** 🎯 |
 
-**The breakthrough:** Async didn't give me more bandwidth - it gave me **latency hiding**, which unlocked the compute units that were waiting on memory.
-Important note: This was NOT a huge improvement in isolation, but combined with async ops, it went from 3.40ms → 3.39ms (every microsecond counts!).
+
 
 
 
@@ -128,7 +131,7 @@ Important note: This was NOT a huge improvement in isolation, but combined with 
 | Time | 3.76ms | **3.39ms** | **-9.8%** (faster!) |
 | **vs cuBLAS** | **92%** | **101.7%** | **+9.7pp** 🎯 |
 
-**The breakthrough:** Async didn't give me more bandwidth - it gave me **latency hiding**, which unlocked the compute units that were waiting on memory.
+
 
 ---
 
